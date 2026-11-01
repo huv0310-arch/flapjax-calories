@@ -19,6 +19,7 @@ disagree.
 """
 
 import json
+import re
 import sys
 import threading
 import time
@@ -366,6 +367,182 @@ def annotate_times(chain, rows):
     return rows
 
 
+# ----------------------------------------------------------- token index ----
+# A public token index answers the same question as a few hundred
+# eth_getLogs windows: which FLAPJAX transfers left the treasury and when. It
+# costs one request and it does not throttle topic filters, which is what the
+# free BSC nodes do after a sustained scan. The trade: the index returns no
+# block number, so rows carry the index's own timestamp, and its coverage is
+# only as deep as the pages you asked for. Both limits are printed, never
+# papered over.
+
+INDEX_HOST = "https://api.binplorer.com"
+INDEX_KEY = "freekey"
+INDEX_PAGE = 100
+
+
+def index_url(address, limit=INDEX_PAGE, skip=0, key=INDEX_KEY):
+    return "%s/getAddressHistory/%s?apiKey=%s&limit=%d&skip=%d" % (
+        INDEX_HOST, address, key, limit, skip)
+
+
+def fetch_index(address, limit=INDEX_PAGE, skip=0, timeout=25, rounds=3,
+                opener=None):
+    """One page of raw index JSON. Retried; ValueError if it never parses."""
+    url = index_url(address, limit, skip)
+    opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    last = None
+    for _ in range(max(1, rounds)):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "flapjax-calories"})
+            resp = opener.open(req, timeout=timeout)
+            body = resp.read().decode("utf-8")
+            if hasattr(resp, "close"):
+                resp.close()
+            return json.loads(body)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = exc
+            time.sleep(1.0)
+    raise ValueError("token index did not answer: %s" % last)
+
+
+def index_rows(payload, wallet=None, token=TOKEN, treasury=TREASURY):
+    """Index operations -> treasury payouts, oldest first, COT attributed.
+
+    Only FLAPJAX transfers actually sent by the treasury survive; other tokens
+    on the same address, incoming transfers, and duplicate tx rows do not.
+    """
+    ops = payload.get("operations") if isinstance(payload, dict) else None
+    want = wallet.lower() if wallet else None
+    seen = set()
+    rows = []
+    for o in ops or []:
+        if not isinstance(o, dict):
+            continue
+        info = o.get("tokenInfo") or {}
+        if (info.get("address") or "").lower() != token.lower():
+            continue
+        frm = (o.get("from") or "").lower()
+        to = (o.get("to") or "").lower()
+        tx = (o.get("transactionHash") or "").lower()
+        if frm != treasury.lower() or not tx or tx in seen:
+            continue
+        if want and to != want:
+            continue
+        try:
+            ts = int(o.get("timestamp"))
+            wei = int(o.get("value"))
+        except (TypeError, ValueError):
+            continue
+        seen.add(tx)
+        cot = cot_datetime(ts)
+        rows.append({"block": None, "tx": tx, "wei": wei, "from": frm, "to": to,
+                     "ts": ts, "cot": cot, "cot_day": cot.date()})
+    rows.sort(key=lambda r: (r["ts"], r["tx"]))
+    return rows
+
+
+def index_depth(args):
+    """Fetch the index and find out how deep it actually goes.
+
+    The host answers one page of the newest 100 operations and IGNORES skip:
+    skip=0/100/200 return the identical set. Asking for more pages therefore
+    goes nowhere, so paging is probed once and reported instead of being
+    assumed. Returns (ops, pages, paging_works, floor_ts).
+    """
+    first = fetch_index(TREASURY, limit=INDEX_PAGE, skip=0)
+    ops = list((first.get("operations") or []) if isinstance(first, dict) else [])
+    pages = 1
+    paging_works = None
+    if args["pages"] > 1 and len(ops) >= INDEX_PAGE:
+        second = fetch_index(TREASURY, limit=INDEX_PAGE, skip=INDEX_PAGE)
+        got = list((second.get("operations") or []) if isinstance(second, dict) else [])
+        tx1 = {(o.get("transactionHash") or "").lower() for o in ops}
+        tx2 = {(o.get("transactionHash") or "").lower() for o in got}
+        paging_works = bool(got) and tx1 != tx2
+        if paging_works:
+            ops.extend(got)
+            pages = 2
+            while pages < args["pages"]:
+                payload = fetch_index(TREASURY, limit=INDEX_PAGE, skip=pages * INDEX_PAGE)
+                got = list((payload.get("operations") or []) if isinstance(payload, dict) else [])
+                if not got:
+                    break
+                ops.extend(got)
+                pages += 1
+                if len(got) < INDEX_PAGE:
+                    break
+    return ops, pages, paging_works
+
+
+def index_cmd(args):
+    wallet = parse_address(args["wallet"])
+    ops, pages, paging_works = index_depth(args)
+
+    now_ts = int(time.time())
+    start_ts, _end_ts, d0, d1 = window_bounds(now_ts, args["days"])
+    all_rows = index_rows({"operations": ops})
+    rows = [r for r in all_rows if r["ts"] >= start_ts]
+    today = cot_date(now_ts)
+    summary = summarize(rows, today, cot_week_start(today))
+    tool_rows = [r for r in rows if "tool" in classify_amount(r["wei"])]
+    reached_back = cot_datetime(all_rows[0]["ts"]).isoformat() if all_rows else None
+    covered = bool(all_rows) and all_rows[0]["ts"] <= start_ts
+
+    if args["json"]:
+        print(json.dumps({
+            "wallet": wallet,
+            "source": {"host": INDEX_HOST, "pages": pages,
+                       "paging_supported": paging_works,
+                       "rows_from_treasury": len(all_rows),
+                       "oldest_row_cot": reached_back,
+                       "window_covered": covered},
+            "window": {"from": d0.isoformat(), "to": d1.isoformat(),
+                       "days": args["days"]},
+            "payouts": [{"tx": r["tx"], "wei": str(r["wei"]), "fj": wei_to_fj(r["wei"]),
+                         "to": r["to"], "cot_time": r["cot"].isoformat(),
+                         "cot_day": r["cot_day"].isoformat(),
+                         "rails_amount_only": classify_amount(r["wei"])}
+                        for r in rows],
+            "summary": summary,
+            "tool_rail": {"payouts_of_tool_size": len(tool_rows),
+                          "tx": [r["tx"] for r in tool_rows]},
+        }, indent=2))
+    else:
+        print("wallet     %s" % wallet)
+        print("window     %s .. %s COT (%.2f days)" % (d0.isoformat(), d1.isoformat(),
+                                                       args["days"]))
+        print("source     %s (%d page(s), %d treasury row(s), no block scan)"
+              % (INDEX_HOST, pages, len(all_rows)))
+        if paging_works is False:
+            print("paging     the host ignores skip (page 2 is page 1) -> "
+                  "this read is the NEWEST %d operations and no flag goes deeper"
+                  % len(ops))
+        if reached_back:
+            print("floor      oldest row in this read: %s COT%s" % (
+                reached_back, "" if covered else "  <-- WINDOW NOT FULLY COVERED"))
+        print("")
+        print_table(rows)
+        print("")
+        print("per COT day")
+        for day, agg in summary["days"].items():
+            print("  %-10s %2d payout(s)  %18s FJ" % (day, agg["count"], pretty_fj(agg["wei"])))
+        print("")
+        print("today %s  %d / %d paid payouts, %s FJ" % (
+            summary["today"]["day"], summary["today"]["count"],
+            PAID_CLAIMS_PER_COT_DAY, pretty_fj(summary["today"]["wei"])))
+        print("tool rail  %d payout(s) of tool size in the covered part%s" % (
+            len(tool_rows), "" if tool_rows else " -> no 15M/18M payment seen here"))
+        if not covered:
+            print("")
+            print("INCOMPLETE: the index floor is %s COT, inside the window you asked for." % reached_back)
+            print("            Payouts older than that are NOT in this read, and --pages cannot reach them.")
+            print("            For the full window use: ledger or slots with a paid --rpc.")
+            print("            exit 5 marks this read as partial on purpose.")
+            return 5
+    return 0
+
+
 # ------------------------------------------------------------- reporting ----
 
 def summarize(rows, today_cot, week_start_cot):
@@ -396,7 +573,8 @@ def print_table(rows):
         rail = ",".join(classify_amount(r["wei"])) or "amount matches no board rail"
         print("%-10s %-17s %18s %11s  %-12s %s | %s" % (
             r["cot_day"].isoformat(), r["cot"].strftime("%Y-%m-%d %H:%M"),
-            wei_to_fj(r["wei"]), "{:,}".format(r["block"]), r["tx"][:10] + "..",
+            wei_to_fj(r["wei"]), "{:,}".format(r["block"]) if r.get("block") else "index",
+            r["tx"][:10] + "..",
             r.get("receipt_note", "not checked"), rail))
 
 
@@ -600,11 +778,290 @@ def board(args):
     return 0
 
 
+def iso_to_ts(text):
+    """ISO-8601 -> epoch seconds. Accepts Z, an explicit offset, or a trailing
+    'COT' (the board's own clock); a bare time is read as UTC."""
+    t = str(text).strip()
+    cot = t.upper().endswith("COT")
+    if cot:
+        t = t[:-3].strip()
+    t = t.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        raise ValueError("cannot read time %r (use 2026-10-26T00:00Z or "
+                         "'2026-10-26 00:00 COT')" % text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc if not cot else COT)
+    return int(dt.timestamp())
+
+
+def slots(args):
+    """Every treasury payout of at least --min FJ in a window, to anyone.
+
+    The weekly rail question ("is the 15M tool slot already paid?") cannot be
+    answered from one wallet's history: the winner is whoever the treasury paid,
+    and that is a different address. So this scans the treasury's outbound
+    transfers and names the rails by amount, and it prints the block range it
+    covered so a short scan cannot pass for a full one.
+    """
+    min_wei = int(round(float(args["min"]) * 10 ** 18))
+    if min_wei <= 0:
+        raise ValueError("--min must be > 0 FJ")
+    chain = Chain([args["rpc"]] if args.get("rpc") else None, jobs=args["jobs"])
+    head = chain.head()
+    now_ts = chain.block_ts(head)
+    start_ts = iso_to_ts(args["from"]) if args.get("from") else now_ts - int(args["days"] * 86400)
+    end_ts = min(iso_to_ts(args["to"]), now_ts) if args.get("to") else now_ts
+    if start_ts >= end_ts:
+        raise ValueError("--from must be earlier than --to")
+    start_block = chain.block_at(start_ts)
+    end_block = min(chain.block_at(end_ts), head)
+
+    raw = chain.transfer_logs(start_block, end_block)
+    everything = annotate_times(chain, build_rows(raw, None))
+    rows = [r for r in everything if r["wei"] >= min_wei and start_ts <= r["ts"] <= end_ts]
+    windows = (end_block - start_block) // WINDOW + 1
+    big_tool = [r for r in rows if "tool" in classify_amount(r["wei"])]
+
+    if args["json"]:
+        print(json.dumps({
+            "source": "eth_getLogs", "providers": chain.used,
+            "window": {"from_cot": cot_datetime(start_ts).isoformat(),
+                       "to_cot": cot_datetime(end_ts).isoformat(),
+                       "start_block": start_block, "end_block": end_block,
+                       "windows_scanned": windows},
+            "treasury_outflows_seen": len(everything),
+            "min_fj": str(args["min"]),
+            "big_payouts": [{"tx": r["tx"], "block": r["block"], "to": r["to"],
+                             "wei": str(r["wei"]), "fj": wei_to_fj(r["wei"]),
+                             "cot_time": r["cot"].isoformat(),
+                             "cot_day": r["cot_day"].isoformat(),
+                             "rails_amount_only": classify_amount(r["wei"])} for r in rows],
+            "tool_sized": len(big_tool),
+        }, indent=2))
+        return 0
+
+    print("treasury   %s" % TREASURY)
+    print("window     %s .. %s COT" % (cot_datetime(start_ts).strftime("%Y-%m-%d %H:%M"),
+                                       cot_datetime(end_ts).strftime("%Y-%m-%d %H:%M")))
+    print("blocks     %s .. %s" % ("{:,}".format(start_block), "{:,}".format(end_block)))
+    print("scan       %d window(s) of %d blocks, every one answered (no silent gaps)"
+          % (windows, WINDOW))
+    print("outflows   %d treasury payout(s) in window, %d at or above %s FJ"
+          % (len(everything), len(rows), args["min"]))
+    print("")
+    if rows:
+        print("%-10s %-17s %16s %-38s %s" % ("COT day", "time (COT)", "amount FJ", "to", "tx"))
+        for r in rows:
+            print("%-10s %-17s %16s %-38s %s" % (
+                r["cot_day"].isoformat(), r["cot"].strftime("%Y-%m-%d %H:%M"),
+                wei_to_fj(r["wei"]), r["to"], r["tx"][:20] + ".."))
+    else:
+        print("no treasury payout reached %s FJ in this window - the big rails were "
+              "not paid here" % args["min"])
+    print("")
+    print("tool rail  %d payment(s) of tool size (15M, or 18M at 1.2x) in this window%s"
+          % (len(big_tool), "" if big_tool else " -> slot not paid in the part scanned"))
+    print("note       amount alone cannot name a rail; 'tool' means 15M or 18M, "
+          "which is also what meme x7.5 and dogma x5 would look like, so read the "
+          "recipient before calling the slot taken.")
+    return 0
+
+
+# --------------------------------------------------------------- payouts ----
+# The board publishes its own payout ledger on flapjax.surge.sh: every line has
+# the amount, the COT day, the rail *by name*, the handle that was paid and the
+# tx hash. A block scan can only tell you that 15,000,000 FJ left the treasury;
+# it cannot tell you the treasury paid it as "tool" - and it cannot be made to
+# cover a whole week on free endpoints (public nodes cap eth_getLogs at 5,000
+# blocks, so a week is ~270 windows). One page fetch answers the weekly-slot
+# question that the scan cannot.
+
+PAYOUTS_URL = "https://flapjax.surge.sh/"
+PAYOUTS_UA = "flapjax-calories/1.0 (read-only; one page fetch)"
+
+
+def fetch_payouts_page(url=PAYOUTS_URL, timeout=45, rounds=3):
+    """Fetch the board page. Raises ChainError when it never answers."""
+    last = None
+    for _ in range(max(1, int(rounds))):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": PAYOUTS_UA})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except Exception as exc:                       # noqa: BLE001 - retried
+            last = exc
+            time.sleep(1.5)
+    raise ChainError("board page unreachable: %s" % last)
+
+
+_ENTITIES = (("&middot;", "·"), ("&hellip;", "…"), ("&nbsp;", " "),
+             ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"))
+
+
+def _text(fragment):
+    """Tags out, entities in: the ledger writes its separators as
+    &middot; in some builds and as a literal · in others; the rail
+    regex must not care which."""
+    out = re.sub(r"<[^>]+>", " ", fragment or "")
+    for ent, ch in _ENTITIES:
+        out = out.replace(ent, ch)
+    return re.sub(r"\s+", " ", out).strip()
+
+
+def parse_payouts(html):
+    """Parse the board's payout ledger into rows.
+
+    Each row: handle, amount_fj (float), day ('YYYY-MM-DD', COT), rail (the
+    board's own label, lower-cased), rail_key (first word, for slot counting),
+    tx (full hash or None), tx_short ('0x0fd8a2a4…a0ec'), work (the verifier
+    sentence when the board printed one).
+    """
+    rows = []
+    handle = None
+    for m in re.finditer(
+            r'<span class="fjx-c-handle">([^<]+)</span>'
+            r'|<li class="fjx-c-item">(.*?)</li>', html, re.S):
+        if m.group(1) is not None:
+            handle = m.group(1).strip()
+            continue
+        block = m.group(2)
+        amt = re.search(r'<span class="fjx-c-amt">\s*([\d,]+)\s*FLAPJAX', block)
+        meta = re.search(r'<span class="fjx-c-meta">(.*?)</span>', block, re.S)
+        if not amt or not meta:
+            continue
+        meta_txt = _text(meta.group(1))
+        day = re.search(r"(\d{4}-\d{2}-\d{2})", meta_txt)
+        if not day:
+            continue
+        rail = ""
+        rail_m = re.search(r"\d{4}-\d{2}-\d{2}\s*·\s*(.*?)\s*·\s*(?:tx\b|$)",
+                           meta_txt)
+        if rail_m:
+            rail = rail_m.group(1).strip().lower()
+        full_tx = re.search(r"bscscan\.com/tx/(0x[0-9a-fA-F]{64})", block)
+        short_tx = re.search(r"tx\s+(0x[0-9a-fA-F]{4,10})\s*…", meta_txt) \
+            or re.search(r"tx\s+([0-9a-fA-F]{4,10})", meta_txt)
+        work = re.search(r'<span class="fjx-c-work">(.*?)</span>', block, re.S)
+        rows.append({
+            "handle": handle,
+            "amount_fj": float(amt.group(1).replace(",", "")),
+            "day": day.group(1),
+            "rail": rail,
+            "rail_key": (rail.split(" ")[0] if rail else ""),
+            "tx": full_tx.group(1) if full_tx else None,
+            "tx_short": short_tx.group(1) if short_tx else None,
+            "work": _text(work.group(1))[:200] if work else "",
+        })
+    return rows
+
+
+def parse_treasury_stamp(html):
+    """The page's own live receipt: (balance_fj, block, '2026-11-01 11:22 COT')."""
+    m = re.search(r"([\d,]{4,})\s*FLAPJAX at BSC block\s*(\d+)\s*\(([^)]+)\)",
+                  html)
+    if not m:
+        return None
+    return (float(m.group(1).replace(",", "")), int(m.group(2)), m.group(3))
+
+
+def slot_state(rows, rail, day):
+    """Slots left on a weekly rail in the COT week containing `day`.
+
+    Returns (cap, paid, open_). cap is None when the board prints no weekly cap
+    for that rail; open_ is None when there is no cap to compare against.
+    """
+    cap = SLOTS.get(rail)
+    wk = cot_week_start(day)
+    paid = sum(1 for r in rows
+               if r["rail_key"] == rail and r["day"]
+               and wk <= date.fromisoformat(r["day"]) <= wk + timedelta(days=6))
+    if cap is None:
+        return (None, paid, None)
+    return (cap, paid, paid < cap)
+
+
+def payouts(args):
+    """Answer 'is this week's <rail> slot still open' from the board's ledger."""
+    html = fetch_payouts_page()
+    rows = parse_payouts(html)
+    if not rows:
+        sys.stderr.write("board page fetched but no ledger rows parsed - the "
+                         "markup changed; refusing to report an empty ledger\n")
+        return 3
+    today = cot_date(int(args.get("now") or time.time()))
+    week = cot_week_start(today)
+    since = args.get("since")
+    rail = args.get("rail")
+    keep = []
+    for r in rows:
+        if since and r["day"] < since:
+            continue
+        if rail and not (r["rail_key"] == rail or r["rail"].startswith(rail)):
+            continue
+        keep.append(r)
+    keep.sort(key=lambda r: (r["day"], r["amount_fj"]), reverse=True)
+    limit = max(1, int(args.get("limit") or 20))
+    stamp = parse_treasury_stamp(html)
+    verdicts = []
+    for name, _base in RAILS:
+        cap, paid, open_ = slot_state(rows, name, today)
+        if cap is not None:
+            verdicts.append({"rail": name, "cap": cap, "paid": paid,
+                             "open": open_})
+    if args["json"]:
+        print(json.dumps({
+            "source": {"url": PAYOUTS_URL, "rows": len(rows),
+                       "treasury": ({"balance_fj": stamp[0], "block": stamp[1],
+                                     "as_of": stamp[2]} if stamp else None)},
+            "week_start_cot": week.isoformat(),
+            "slots": verdicts,
+            "payouts": keep[:limit],
+        }, indent=2, sort_keys=True))
+        return 0
+    print("source %s (%d ledger row(s), one page, no block scan)"
+          % (PAYOUTS_URL, len(rows)))
+    if stamp:
+        print("page receipt: %s FJ at block %d (%s)"
+              % (pretty_fj(int(round(stamp[0] * 10 ** 18))), stamp[1], stamp[2]))
+    print("COT week containing %s starts %s (Mon 00:00 COT)" % (today, week))
+    print("")
+    print("weekly slots, from the board's own ledger:")
+    for v in verdicts:
+        state = "OPEN" if v["open"] else "TAKEN"
+        print("  %-6s %d/%d paid this week  -> %s"
+              % (v["rail"], v["paid"], v["cap"], state))
+    if keep:
+        print("")
+        shown = keep[:limit]
+        print("%-10s %14s  %-10s %-18s %s"
+              % ("day", "amount FJ", "rail", "handle", "tx"))
+        for r in shown:
+            print("%-10s %14s  %-10s %-18s %s"
+                  % (r["day"], pretty_fj(int(round(r["amount_fj"] * 10 ** 18))),
+                     r["rail"] or "?", (r["handle"] or "?")[:18],
+                     r["tx_short"] or "?"))
+        if len(keep) > len(shown):
+            print("... %d more row(s) not shown (--limit %d)"
+                  % (len(keep) - len(shown), limit))
+    else:
+        print("")
+        print("no ledger row matched %s" % (
+            " ".join(x for x in ("--rail " + rail if rail else "",
+                                 "--since " + since if since else "") if x)
+            or "this filter"))
+    return 0
+
+
 USAGE = """flapjax-calories - read-only FLAPJAX income ledger for one wallet
 
   python3 flapjax_calories.py ledger <wallet> [--days 7] [--json] [--no-verify] [--rpc URL] [--jobs N]
   python3 flapjax_calories.py hold   <wallet> [--days 30] [--json] [--rpc URL] [--jobs N]
   python3 flapjax_calories.py board  [--days 7] [--json] [--rpc URL] [--jobs N]
+  python3 flapjax_calories.py index  <wallet> [--days 7] [--pages 3] [--json]
+  python3 flapjax_calories.py slots  [--days 7] [--from T] [--to T] [--min FJ] [--json] [--rpc URL] [--jobs N]
+  python3 flapjax_calories.py payouts [--rail NAME] [--since YYYY-MM-DD] [--limit N] [--json]
 
 ledger  treasury -> wallet payouts in the last N COT days, each one cross-read
         against its own receipt, grouped by COT day, with the daily paid-claim
@@ -613,8 +1070,26 @@ hold    received vs still-held, the number behind the 1.2x holder bonus.
 board   every treasury payout in the window, bucketed by the rail its amount is
         compatible with, against the board's weekly slot caps - so you can see
         whether the tool slot (1/week) is still open before you spend a day on it.
+index   the same treasury ledger from a public token index instead of a block
+        scan: one request, no throttled eth_getLogs, no block numbers. The host
+        returns the newest 100 operations and ignores skip, so this command
+        probes that and prints the floor it actually reached; when the window it
+        was asked for is not covered it says so and exits 5. It never calls a
+        partial window complete.
+slots   treasury payouts of at least --min FJ to anyone, which is how you answer
+        the weekly rail question: a slot is taken when the treasury paid it, not
+        when your own wallet received something. Prints the block range scanned.
+        --from/--to take ISO times ('2026-10-26T00:00Z' or '2026-10-26 00:00 COT').
+payouts the board's own payout ledger (flapjax.surge.sh), one page: amount,
+        COT day, the rail *by name*, the handle paid and the tx hash - plus
+        its weekly-slot verdict per rail (tool 1/week etc). A block scan can
+        prove 15,000,000 FJ left the treasury but not that it was paid as
+        'tool'; and a whole week is ~270 throttled windows on free nodes.
+        --rail tool --since 2026-10-26 answers 'is this week's tool slot
+        still open' in one request.
 
-Exit codes: 0 ok, 2 bad input, 3 no provider, 4 log and receipt disagree.
+Exit codes: 0 ok, 2 bad input, 3 no provider, 4 log and receipt disagree,
+            5 index window not fully covered.
 """
 
 
@@ -622,29 +1097,49 @@ def parse_argv(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         raise SystemExit(USAGE)
     cmd, rest = argv[0], argv[1:]
-    if cmd not in ("ledger", "hold", "board"):
+    if cmd not in ("ledger", "hold", "board", "index", "slots", "payouts"):
         raise SystemExit("unknown command %r\n\n%s" % (cmd, USAGE))
-    if cmd != "board" and not rest:
+    walletless = ("board", "slots", "payouts")
+    if cmd not in walletless and not rest:
         raise SystemExit("missing wallet address\n\n%s" % USAGE)
-    args = {"cmd": cmd, "wallet": None if cmd == "board" else rest[0],
+    args = {"cmd": cmd, "wallet": None if cmd in walletless else rest[0],
             "days": 30.0 if cmd == "hold" else 7.0,
-            "json": False, "no_verify": False, "rpc": None, "jobs": 3}
-    i = 0 if cmd == "board" else 1
+            "json": False, "no_verify": False, "rpc": None, "jobs": 3, "pages": 3,
+            "from": None, "to": None, "min": 1000000.0,
+            "rail": None, "since": None, "limit": 20, "now": None}
+    i = 0 if cmd in walletless else 1
     while i < len(rest):
         a = rest[i]
         if a == "--json":
             args["json"] = True
         elif a == "--no-verify":
             args["no_verify"] = True
-        elif a in ("--days", "--rpc", "--jobs"):
+        elif a in ("--days", "--rpc", "--jobs", "--pages", "--from", "--to",
+                   "--min", "--rail", "--since", "--limit"):
             if i + 1 >= len(rest):
                 raise SystemExit("%s needs a value" % a)
             if a == "--days":
                 args["days"] = float(rest[i + 1])
                 if args["days"] <= 0:
                     raise SystemExit("--days must be > 0")
+            elif a == "--pages":
+                args["pages"] = max(1, int(rest[i + 1]))
             elif a == "--jobs":
                 args["jobs"] = max(1, int(rest[i + 1]))
+            elif a == "--min":
+                args["min"] = float(rest[i + 1])
+            elif a == "--limit":
+                args["limit"] = max(1, int(rest[i + 1]))
+            elif a == "--rail":
+                args["rail"] = rest[i + 1].strip().lower()
+            elif a == "--since":
+                try:
+                    date.fromisoformat(rest[i + 1])
+                except ValueError:
+                    raise SystemExit("--since needs a YYYY-MM-DD day")
+                args["since"] = rest[i + 1]
+            elif a in ("--from", "--to"):
+                args[a[2:]] = rest[i + 1]
             else:
                 args["rpc"] = rest[i + 1]
             i += 1
@@ -661,6 +1156,12 @@ def main(argv=None):
             return ledger(args)
         if args["cmd"] == "hold":
             return hold(args)
+        if args["cmd"] == "index":
+            return index_cmd(args)
+        if args["cmd"] == "slots":
+            return slots(args)
+        if args["cmd"] == "payouts":
+            return payouts(args)
         return board(args)
     except ValueError as exc:
         sys.stderr.write("bad input: %s\n" % exc)

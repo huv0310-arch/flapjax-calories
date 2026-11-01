@@ -28,7 +28,8 @@ standard library only (Python 3.8+).
 ```bash
 git clone <this repo>
 cd flapjax-calories
-python3 -m unittest test_flapjax_calories -v      # 46 tests, no network
+python3 -m unittest test_flapjax_calories -v      # 67 tests, no network
+python3 flapjax_calories.py payouts --rail tool   # is this week's tool slot open?
 python3 flapjax_calories.py ledger 0xWALLET --days 1
 python3 flapjax_calories.py board --days 7
 ```
@@ -40,6 +41,27 @@ minutes, because the one public node that answers topic-filtered queries starts
 throttling under a sustained scan (`--rpc` a paid endpoint for a week scan).
 Neither uses an indexer: every row is an RPC log, and `ledger` re-reads each
 payout's own receipt on a second read as a cross-check.
+
+`payouts` is the honest shortcut for the weekly-slot question: one fetch of the
+board's own ledger page (`flapjax.surge.sh`), which states the rail *by name*,
+the recipient handle, the COT day and the tx hash, and a slot verdict per rail:
+
+```
+$ python3 flapjax_calories.py payouts --rail tool
+source https://flapjax.surge.sh/ (542 ledger row(s), one page, no block scan)
+page receipt: 824,182,279.00 FJ at block 131080181 (2026-11-01 11:22 COT)
+weekly slots, from the board's own ledger:
+  tool   0/1 paid this week  -> OPEN
+2026-10-24  15,000,000.00  tool  @arispay-x402  0x0fd8a2a4
+2026-10-21  15,000,000.00  tool  @arenaforge_lab 0xff407e02
+...
+```
+
+Why that beats a scan here: a block scan proves 15,000,000 FJ left the treasury,
+but not that the treasury called it `tool`, and not who got it. The ledger names
+both, and it is one request instead of ~270 throttled windows. `payouts` refuses
+to report an empty week when the page parses to zero rows - that means the
+markup moved, so it exits 3 instead of telling you the slot is open.
 
 ## What it prints
 
@@ -129,9 +151,12 @@ treasury's behaviour disagree, the treasury is the one that pays.
 
 ## Unmeasured / limitations
 
-- **Rail is inferred from amount, never from the board's own ledger**, because
-  the board does not publish one. Multi-claim transfers (one transfer covering
-  two claims) and partial payments therefore land in `unclassified`.
+- **`ledger`/`board`/`slots` infer the rail from the amount**, because a transfer
+  log carries no reason. Multi-claim transfers (one transfer covering two
+  claims) and partial payments therefore land in `unclassified` — that column
+  refuses to invent a label. `payouts` is the other way round: it reads the
+  board's *published* ledger, so the rail there is the board's own word, and it
+  covers the whole week in one request.
 - **The 80% hold check is a balanceOf read at payout time.** A windowed ratio
   (`received in window` vs `balance now`) can exceed 100% when the wallet was fed
   before the window; it is an estimate, not a ruling. `hold` says so out loud.

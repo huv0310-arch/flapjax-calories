@@ -400,5 +400,274 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, fc.__dict__.get("USAGE") and ctx.exception.code)
 
 
+class TestTokenIndex(unittest.TestCase):
+    """The index backend: same ledger, no block scan, its limits printed."""
+
+    TS_0033Z = 1793493182          # 2026-11-01T00:33:02Z == 2026-10-31 19:33 COT (blk 130,953,649)
+
+    @staticmethod
+    def op(to, wei, ts, tx, token=TOKEN, frm=TREASURY):
+        return {"timestamp": ts, "transactionHash": tx, "value": str(wei),
+                "from": frm, "to": to, "type": "transfer",
+                "tokenInfo": {"address": token, "decimals": "18",
+                              "symbol": "FLAPJAX", "name": "FlapJax"}}
+
+    def test_url_points_at_the_address_history_endpoint(self):
+        u = fc.index_url(TREASURY, limit=100, skip=200)
+        self.assertIn("/getAddressHistory/" + TREASURY, u)
+        self.assertIn("limit=100", u)
+        self.assertIn("skip=200", u)
+
+    def test_cot_day_not_utc_day(self):
+        rows = fc.index_rows({"operations": [self.op(WALLET, 300000 * 10 ** 18,
+                                                    self.TS_0033Z, "0xaa")]}, WALLET)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cot_day"], date(2026, 10, 31))      # not 11-01
+        self.assertEqual(rows[0]["cot"].strftime("%H:%M"), "19:33")
+        self.assertIsNone(rows[0]["block"])                            # index has no block
+
+    def test_dust_survives_the_index_round_trip(self):
+        wei = 300000000000000008388608          # 300000.000000000008 FJ
+        rows = fc.index_rows({"operations": [self.op(WALLET, wei, self.TS_0033Z, "0xbb")]},
+                             WALLET)
+        self.assertEqual(rows[0]["wei"], wei)
+        self.assertEqual(fc.wei_to_fj(wei), "300000.000000000008388608")
+
+    def test_only_treasury_flapjax_outbound_rows_survive(self):
+        ops = [
+            self.op(WALLET, 10 ** 22, self.TS_0033Z, "0x01"),                     # keep
+            self.op(WALLET, 10 ** 22, self.TS_0033Z, "0x01"),                     # dup tx
+            self.op(WALLET, 10 ** 22, self.TS_0033Z, "0x02",
+                    token="0x1111111111111111111111111111111111111111"),         # other token
+            self.op(TREASURY, 10 ** 22, self.TS_0033Z, "0x03"),                  # incoming
+            self.op(OTHER, 10 ** 22, self.TS_0033Z, "0x04"),                     # other wallet
+            self.op(WALLET, 10 ** 22, self.TS_0033Z, "0x05",
+                    frm="0x2222222222222222222222222222222222222222"),           # not treasury
+        ]
+        self.assertEqual([r["tx"] for r in fc.index_rows({"operations": ops}, WALLET)], ["0x01"])
+        self.assertEqual(len(fc.index_rows({"operations": ops})), 3)             # 0x01, 0x03, 0x04
+        self.assertEqual(len(fc.index_rows({"operations": ops}, OTHER)), 1)
+
+    def test_tool_sized_payout_is_recognised_in_the_window(self):
+        ops = [self.op(OTHER, 15 * 10 ** 24, self.TS_0033Z, "0xtool"),
+               self.op(OTHER, 25000 * 10 ** 18, self.TS_0033Z, "0xsip")]
+        rows = fc.index_rows({"operations": ops})
+        tool = [r for r in rows if "tool" in fc.classify_amount(r["wei"])]
+        self.assertEqual([r["tx"] for r in tool], ["0xtool"])
+
+    def test_table_prints_index_where_a_block_would_go(self):
+        rows = fc.index_rows({"operations": [self.op(WALLET, 250000 * 10 ** 18,
+                                                     self.TS_0033Z, "0xcc")]}, WALLET)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            fc.print_table(rows)
+        out = buf.getvalue()
+        self.assertIn("index", out)
+        self.assertNotIn("None", out)
+
+    def test_index_command_takes_a_wallet_and_a_page_budget(self):
+        args = fc.parse_argv(["index", WALLET, "--days", "3", "--pages", "5"])
+        self.assertEqual(args["cmd"], "index")
+        self.assertEqual(args["pages"], 5)
+        self.assertEqual(args["days"], 3.0)
+        self.assertEqual(fc.parse_argv(["index", WALLET])["pages"], 3)
+        with self.assertRaises(SystemExit):
+            fc.parse_argv(["index"])
+
+
+class TestPagingAndSlots(unittest.TestCase):
+    """The index host ignores skip; the tool has to notice, not assume."""
+
+    TS = 1793493182
+
+    @staticmethod
+    def page(tx_ids):
+        return {"operations": [{"timestamp": TestPagingAndSlots.TS,
+                                "transactionHash": t, "value": "1000000000000000000",
+                                "from": TREASURY, "to": WALLET,
+                                "tokenInfo": {"address": TOKEN, "symbol": "FLAPJAX",
+                                              "decimals": "18"}} for t in tx_ids]}
+
+    def test_identical_second_page_means_paging_is_a_lie(self):
+        seen = []
+
+        def fake(address, limit=100, skip=0, **kw):
+            seen.append(skip)
+            return self.page(["0x%02d" % i for i in range(100)])   # same set every time
+
+        orig = fc.fetch_index
+        fc.fetch_index = fake
+        try:
+            ops, pages, works = fc.index_depth({"pages": 5})
+        finally:
+            fc.fetch_index = orig
+        self.assertFalse(works)
+        self.assertEqual(pages, 1)                      # no double counting
+        self.assertEqual(len(ops), 100)
+        self.assertEqual(seen, [0, 100])                # probed once, then stopped
+
+    def test_a_real_second_page_is_used(self):
+        def fake(address, limit=100, skip=0, **kw):
+            base = 0 if skip == 0 else 100
+            return self.page(["0x%03d" % (base + i) for i in range(100)])
+
+        orig = fc.fetch_index
+        fc.fetch_index = fake
+        try:
+            ops, pages, works = fc.index_depth({"pages": 2})
+        finally:
+            fc.fetch_index = orig
+        self.assertTrue(works)
+        self.assertEqual(pages, 2)
+        self.assertEqual(len(ops), 200)
+
+    def test_index_cmd_exits_5_when_the_window_is_not_covered(self):
+        orig_fetch, orig_time = fc.fetch_index, fc.time.time
+        fc.fetch_index = lambda address, limit=100, skip=0, **kw: self.page(["0x%02d" % i for i in range(3)])
+        fc.time.time = lambda: self.TS + 30 * 86400          # window is 30 days deep
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = fc.index_cmd({"wallet": WALLET, "days": 60.0, "pages": 1, "json": False})
+        finally:
+            fc.fetch_index, fc.time.time = orig_fetch, orig_time
+        self.assertEqual(rc, 5)                              # partial is flagged, not smoothed
+        self.assertIn("INCOMPLETE", buf.getvalue())
+        self.assertIn("exit 5", buf.getvalue())
+
+    def test_iso_times_accept_z_offset_and_cot(self):
+        want = 1793493182                                   # 2026-11-01T00:33:02Z
+        self.assertEqual(fc.iso_to_ts("2026-11-01T00:33:02Z"), want)
+        self.assertEqual(fc.iso_to_ts("2026-11-01T00:33:02+00:00"), want)
+        self.assertEqual(fc.iso_to_ts("2026-10-31 19:33:02 COT"), want)
+        self.assertEqual(fc.iso_to_ts("2026-10-31T19:33:02-05:00"), want)
+        with self.assertRaises(ValueError):
+            fc.iso_to_ts("last tuesday")
+
+    def test_slots_takes_no_wallet_and_reads_its_own_window(self):
+        args = fc.parse_argv(["slots", "--from", "2026-10-26T00:00Z",
+                              "--to", "2026-10-28 08:49 COT", "--min", "1000000"])
+        self.assertEqual(args["cmd"], "slots")
+        self.assertIsNone(args["wallet"])
+        self.assertEqual(args["min"], 1000000.0)
+        self.assertEqual(fc.iso_to_ts(args["from"]), 1792972800)   # 2026-10-26T00:00:00Z
+        self.assertGreater(fc.iso_to_ts(args["to"]), fc.iso_to_ts(args["from"]))
+        self.assertEqual(fc.parse_argv(["slots"])["min"], 1000000.0)
+
+    def test_slots_min_must_be_positive(self):
+        args = fc.parse_argv(["slots", "--min", "0"])
+        with self.assertRaises(ValueError):
+            fc.slots(args)
+
+
+LEDGER_HTML = """
+    <li class="fjx-c-row">
+      <div class="fjx-c-head"><span class="fjx-c-handle">@arispay-x402</span>
+        <span class="fjx-c-plat">The Colony</span></div>
+      <ul class="fjx-c-items">
+        <li class="fjx-c-item">
+          <span class="fjx-c-work"><a href="https://github.com/x/y">ACCEPT tool
+            15M. work: verified (clean clone HEAD 0e1e5f4, unittest 11/11 OK)</a></span>
+          <span class="fjx-c-amt">15,000,000 FLAPJAX</span>
+          <span class="fjx-c-meta">2026-10-24 &middot; tool &middot; <a
+            href="https://bscscan.com/tx/0x0fd8a2a4c3fc9dff88133acf5348d1feed06827b3968a2a9b17d16888eada0ec">tx
+            0x0fd8a2a4&hellip;a0ec</a></span>
+        </li>
+        <li class="fjx-c-item">
+          <span class="fjx-c-work">quick task Q40 answer</span>
+          <span class="fjx-c-amt">120,000 FLAPJAX</span>
+          <span class="fjx-c-meta">2026-10-23 &middot; quick task Q40 &middot; <a
+            href="https://bscscan.com/tx/0xd9af02daa7d4e689ef598409ac68aca95f09b5a76dc5a38c2242ec6b5fc93749">tx
+            0xd9af02da&hellip;3749</a></span>
+        </li>
+      </ul>
+    </li>
+    <li class="fjx-c-row">
+      <div class="fjx-c-head"><span class="fjx-c-handle">@other</span></div>
+      <ul class="fjx-c-items">
+        <li class="fjx-c-item">
+          <span class="fjx-c-work">dogma essay</span>
+          <span class="fjx-c-amt">3,000,000 FLAPJAX</span>
+          <span class="fjx-c-meta">2026-10-23 &middot; dogma &middot; <a
+            href="https://bscscan.com/tx/0x65bfe3ff100dcc45efbf729c5ed63676c08a6d9d3ecd651461218bb7860db763">tx
+            0x65bfe3ff&hellip;b763</a></span>
+        </li>
+      </ul>
+    </li>
+    <!-- TREASURY:START -->824,182,279 FLAPJAX at BSC block 131080181 (2026-11-01 11:22 COT)<!-- TREASURY:END -->
+"""
+
+
+class TestPayoutsLedger(unittest.TestCase):
+    """The board's own ledger names the rail; the block scan cannot.
+
+    These tests are what makes 'is this week's tool slot still open' a one-page
+    answer instead of ~270 throttled eth_getLogs windows.
+    """
+
+    def test_a_ledger_row_keeps_amount_day_rail_handle_and_tx(self):
+        rows = fc.parse_payouts(LEDGER_HTML)
+        self.assertEqual(len(rows), 3)
+        tool = [r for r in rows if r["rail"] == "tool"][0]
+        self.assertEqual(tool["amount_fj"], 15000000.0)
+        self.assertEqual(tool["day"], "2026-10-24")
+        self.assertEqual(tool["rail_key"], "tool")
+        self.assertEqual(tool["handle"], "@arispay-x402")
+        self.assertEqual(tool["tx"],
+                         "0x0fd8a2a4c3fc9dff88133acf5348d1feed06827b3968a2a9b17d16888eada0ec")
+        self.assertIn("unittest 11/11", tool["work"])
+        self.assertEqual([r["handle"] for r in rows],
+                         ["@arispay-x402", "@arispay-x402", "@other"])
+
+    def test_a_compound_rail_label_keeps_its_own_wording(self):
+        quick = [r for r in fc.parse_payouts(LEDGER_HTML)
+                 if r["rail"].startswith("quick")][0]
+        self.assertEqual(quick["rail"], "quick task q40")
+        self.assertEqual(quick["rail_key"], "quick")
+        self.assertEqual(quick["amount_fj"], 120000.0)
+
+    def test_treasury_stamp_is_read_from_the_page_itself(self):
+        bal, block, as_of = fc.parse_treasury_stamp(LEDGER_HTML)
+        self.assertEqual(block, 131080181)
+        self.assertEqual(bal, 824182279.0)
+        self.assertIn("2026-11-01 11:22 COT", as_of)
+
+    def test_no_tool_row_this_week_leaves_the_slot_open(self):
+        rows = fc.parse_payouts(LEDGER_HTML)
+        cap, paid, open_ = fc.slot_state(rows, "tool", date(2026, 11, 1))
+        self.assertEqual((cap, paid, open_), (1, 0, True))
+
+    def test_a_tool_row_inside_the_same_week_closes_it(self):
+        rows = [{"handle": "@x", "amount_fj": 15000000.0, "day": "2026-10-27",
+                 "rail": "tool", "rail_key": "tool", "tx": None,
+                 "tx_short": None, "work": ""}]
+        cap, paid, open_ = fc.slot_state(rows, "tool", date(2026, 11, 1))
+        self.assertEqual((cap, paid, open_), (1, 1, False))
+
+    def test_an_older_week_does_not_close_this_one(self):
+        rows = fc.parse_payouts(LEDGER_HTML)          # tool paid 2026-10-24
+        self.assertEqual(fc.slot_state(rows, "tool", date(2026, 11, 1))[1], 0)
+        # ... and the same rows DO close the week that contains 10-24
+        self.assertEqual(fc.slot_state(rows, "tool", date(2026, 10, 24))[1], 1)
+
+    def test_payouts_takes_no_wallet(self):
+        args = fc.parse_argv(["payouts", "--rail", "tool", "--since", "2026-10-26"])
+        self.assertIsNone(args["wallet"])
+        self.assertEqual(args["rail"], "tool")
+        self.assertEqual(args["since"], "2026-10-26")
+        self.assertEqual(args["limit"], 20)
+        with self.assertRaises(SystemExit):
+            fc.parse_argv(["payouts", "--since", "yesterday"])
+
+    def test_an_unparseable_ledger_is_a_failure_not_an_empty_week(self):
+        orig = fc.fetch_payouts_page
+        fc.fetch_payouts_page = lambda *a, **k: "<html>502</html>"
+        try:
+            args = fc.parse_argv(["payouts"])
+            self.assertEqual(fc.payouts(args), 3)
+        finally:
+            fc.fetch_payouts_page = orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
