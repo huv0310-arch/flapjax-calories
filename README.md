@@ -28,7 +28,7 @@ standard library only (Python 3.8+).
 ```bash
 git clone <this repo>
 cd flapjax-calories
-python3 -m unittest test_flapjax_calories -v      # 45 tests, no network
+python3 -m unittest test_flapjax_calories -v      # 46 tests, no network
 python3 flapjax_calories.py ledger 0xWALLET --days 1
 python3 flapjax_calories.py board --days 7
 ```
@@ -42,10 +42,9 @@ receipt on a second read as a cross-check.
 ## What it prints
 
 ```
-$ python3 flapjax_calories.py ledger 0x97Cd18B8bBB629b17675D868259eA84C0A2A5A9c --days 1
 wallet     0x97cd18b8bbb629b17675d868259ea84c0a2a5a9c
 window     2026-10-31 .. 2026-10-31 COT (1.00 days)
-blocks     130,797,289 .. 130,975,500 (head 130,975,500)
+blocks     130,797,289 .. 130,977,249 (head 130,977,249)
 providers  logs=https://rpc.48.club receipts=cross-read
 
 COT day    time (COT)                 amount FJ       block  tx           receipt / rail
@@ -97,6 +96,25 @@ An amount does not name a rail. 250,000 FJ at 1.2x is 300,000 FJ; 15M at 1.2x is
 (`sip,reach@1.2x`), and `board` puts ambiguous amounts in their own bucket
 instead of assigning them to whichever rail flatters the count. A bucket is only
 called `open`/`full` against a weekly cap when a single rail explains it.
+
+## The published table is not what the treasury pays
+
+Over 79 treasury FLAPJAX outflows in 10-28..11-01 UTC (index read, amounts
+rounded), the amounts actually paid were:
+
+| amount FJ | count | note |
+|---|---|---|
+| 25,000 | 33 | the everyday paid claim - the board table lists sips at 300,000 |
+| 300,000 | 17 | or 250,000 at 1.2x |
+| 250,000 | 14 | reach |
+| 100,000 | 5 | |
+| 120,000 | 3 | 100,000 at 1.2x |
+| 600,000 | 2 | 500,000 at 1.2x |
+| 500,000, 150,000, 50,000, 10,000, 3,000,000 | 1 each | the single 3M is a dogma payout |
+
+So "amount matches no board rail" is not a bug in the matcher: it is the tool
+declining to invent a rail for a real payout. If the board's table and the
+treasury's behaviour disagree, the treasury is the one that pays.
 
 ## Exit codes
 

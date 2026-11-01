@@ -358,6 +358,23 @@ class CommandTests(unittest.TestCase):
         code, _ = self.run_cli(["ledger", WALLET])
         self.assertEqual(code, 3)
 
+    def test_a_window_that_is_refused_is_split_not_dropped(self):
+        ranges = []
+
+        class Picky(fc.Chain):
+            def call(self, method, params, role="default", rounds=2):
+                f = int(params[0]["fromBlock"], 16)
+                t = int(params[0]["toBlock"], 16)
+                if t - f + 1 > 2500:
+                    raise fc.ChainError("limit exceeded")
+                ranges.append((f, t))
+                return [log(WALLET, 10 ** 18, f, "0x%040x" % f)]
+
+        chain = Picky(["http://fake"], jobs=1)
+        got = chain.transfer_logs(5_000_000, 5_004_999)
+        self.assertEqual(len(got), 2)                      # one per half, none lost
+        self.assertEqual(sum(t - f + 1 for f, t in ranges), 5000)
+
     def test_every_get_logs_window_stays_under_the_node_cap(self):
         ranges = []
 

@@ -176,7 +176,7 @@ def hold_ratio(balance_wei, received_wei):
 class Chain(object):
     """Thin JSON-RPC client over public read-only BSC endpoints."""
 
-    def __init__(self, urls=None, timeout=60, jobs=10):
+    def __init__(self, urls=None, timeout=25, jobs=3):
         self.urls = list(urls or RPCS)
         self.timeout = timeout
         self.jobs = max(1, int(jobs))
@@ -184,7 +184,7 @@ class Chain(object):
         self._lock = threading.Lock()
         self._good = {}
 
-    def call(self, method, params, role="default", rounds=2):
+    def call(self, method, params, role="default", rounds=3):
         """Try every provider, then every provider again: public BSC endpoints
         drop TLS mid-request often enough that a single pass cries wolf."""
         last = None
@@ -195,7 +195,9 @@ class Chain(object):
                 order = [good] + [u for u in self.urls if u != good]
         for attempt in range(rounds):
             if attempt:
-                time.sleep(0.6)
+                time.sleep(1.0 + attempt)   # a node that just said "limit
+                                            # exceeded" needs a breath, not a
+                                            # different node
             for url in order:
                 try:
                     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
@@ -257,23 +259,32 @@ class Chain(object):
         if to:
             topics.append(topic_address(to))
 
-        def fetch(win):
+        def ask(lo, hi):
+            return self.call("eth_getLogs", [{
+                "fromBlock": hex(lo), "toBlock": hex(hi),
+                "address": token, "topics": topics}])
+
+        def fetch(win, depth=0):
+            """One window, split on failure: a node that answers 'limit exceeded'
+            for 5,000 blocks often answers 2,500, and splitting beats dropping the
+            window and printing a total that is quietly short."""
             lo, hi = win
             try:
-                return self.call("eth_getLogs", [{
-                    "fromBlock": hex(lo), "toBlock": hex(hi),
-                    "address": token, "topics": topics}])
-            except ChainError as exc:
-                raise ChainError("window %d-%d lost: %s" % (lo, hi, exc))
+                return ask(lo, hi) or []
+            except ChainError:
+                if depth >= 3 or hi - lo < 1000:
+                    raise ChainError("window %d-%d lost after %d splits" % (lo, hi, depth))
+                mid = (lo + hi) // 2
+                return fetch((lo, mid), depth + 1) + fetch((mid + 1, hi), depth + 1)
 
         logs = []
         if self.jobs == 1:
             for win in wins:
-                logs.extend(fetch(win) or [])
+                logs.extend(fetch(win))
         else:
             with ThreadPoolExecutor(max_workers=self.jobs) as pool:
                 for part in pool.map(fetch, wins):
-                    logs.extend(part or [])
+                    logs.extend(part)
         logs.sort(key=lambda l: (int(l.get("blockNumber", "0x0"), 16),
                                  l.get("logIndex", "0x0")))
         return logs
@@ -617,7 +628,7 @@ def parse_argv(argv):
         raise SystemExit("missing wallet address\n\n%s" % USAGE)
     args = {"cmd": cmd, "wallet": None if cmd == "board" else rest[0],
             "days": 30.0 if cmd == "hold" else 7.0,
-            "json": False, "no_verify": False, "rpc": None, "jobs": 10}
+            "json": False, "no_verify": False, "rpc": None, "jobs": 3}
     i = 0 if cmd == "board" else 1
     while i < len(rest):
         a = rest[i]
