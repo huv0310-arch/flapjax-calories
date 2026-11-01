@@ -34,10 +34,12 @@ python3 flapjax_calories.py board --days 7
 ```
 
 A COT day is ~192,000 BSC blocks today, i.e. ~39 windows of the 5,000-block
-`eth_getLogs` cap that public nodes enforce; windows are fetched 10 at a time, so
-one COT day takes roughly a minute and a full week a few minutes. Neither uses
-an indexer: every row is an RPC log, and `ledger` re-reads each payout's own
-receipt on a second read as a cross-check.
+`eth_getLogs` cap that public nodes enforce. One COT day takes **75 seconds**
+measured twice on a free endpoint; a full week is ~270 windows and takes tens of
+minutes, because the one public node that answers topic-filtered queries starts
+throttling under a sustained scan (`--rpc` a paid endpoint for a week scan).
+Neither uses an indexer: every row is an RPC log, and `ledger` re-reads each
+payout's own receipt on a second read as a cross-check.
 
 ## What it prints
 
